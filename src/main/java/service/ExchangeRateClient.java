@@ -1,95 +1,117 @@
 package main.java.service;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import main.java.model.ExchangeRateResponse;
+
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-
+/**
+ * Simple HTTP client for ExchangeRate-API.
+ * - Reads API key from env var: EXCHANGE_RATE_API_KEY
+ * - Provides methods to fetch a pair conversion rate or a converted amount
+ */
 public class ExchangeRateClient {
+
+    private static final String BASE_URL = "https://v6.exchangerate-api.com/v6";
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration READ_TIMEOUT = Duration.ofSeconds(20);
+
     private final String apiKey;
     private final HttpClient httpClient;
+    private final Gson gson;
 
     public ExchangeRateClient() {
-        // Read API key from environment variable
-        this.apiKey = System.getenv("EXCHANGE_RATE_API_KEY");
-        if (this.apiKey == null || this.apiKey.isBlank()) {
+        this(System.getenv("EXCHANGE_RATE_API_KEY"));
+    }
+
+    public ExchangeRateClient(String apiKey) {
+        if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException("Missing environment variable: EXCHANGE_RATE_API_KEY");
         }
-
-        // Create a reusable HttpClient instance
-        this.httpClient = HttpClient.newHttpClient();
+        this.apiKey = apiKey;
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .build();
+        this.gson = new Gson();
     }
 
     /**
-     * Fetches the conversion rate between two currencies using ExchangeRate API.
-     *
-     * @param base   the base currency (e.g., "USD")
-     * @param target the target currency (e.g., "EUR")
-     * @return conversion rate as a double
+     * Returns only the conversion rate for BASE -> TARGET (e.g., USD -> MXN).
      */
     public double getConversionRate(String base, String target) throws IOException, InterruptedException {
-        String url = String.format("https://v6.exchangerate-api.com/v6/%s/pair/%s/%s",
-                apiKey, base.toUpperCase(), target.toUpperCase());
+        String url = String.format("%s/%s/pair/%s/%s",
+                BASE_URL, apiKey, normalize(base), normalize(target));
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .GET()
-                .build();
-
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("HTTP error: " + response.statusCode() + " | " + response.body());
-        }
-
-        JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
-
-        if (!"success".equalsIgnoreCase(json.get("result").getAsString())) {
-            String error = json.has("error-type") ? json.get("error-type").getAsString() : "Unknown error";
-            throw new RuntimeException("API error: " + error);
-        }
-
-        return json.get("conversion_rate").getAsDouble();
+        ExchangeRateResponse data = sendAndParse(url);
+        ensureSuccess(data);
+        return data.getConversionRate();
     }
 
     /**
-     * Fetches the converted amount between two currencies.
-     *
-     * @param base   the base currency (e.g., "USD")
-     * @param target the target currency (e.g., "EUR")
-     * @param amount amount to convert
-     * @return converted amount as a double
+     * Returns the converted amount for BASE -> TARGET with the given amount.
+     * (This hits the /pair/.../{amount} endpoint, which returns conversion_result.)
      */
     public double convert(String base, String target, double amount) throws IOException, InterruptedException {
-        String url = String.format("https://v6.exchangerate-api.com/v6/%s/pair/%s/%s/%.4f",
-                apiKey, base.toUpperCase(), target.toUpperCase(), amount);
+        String url = String.format("%s/%s/pair/%s/%s/%.8f",
+                BASE_URL, apiKey, normalize(base), normalize(target), amount);
 
+        ExchangeRateResponse data = sendAndParse(url);
+        ensureSuccess(data);
+
+        // If conversion_result is missing (when API doesn't include it), compute fallback:
+        if (data.getConversionResult() == 0.0 && data.getConversionRate() != 0.0) {
+            return amount * data.getConversionRate();
+        }
+        return data.getConversionResult();
+    }
+
+    // --------------------- helpers ---------------------
+
+    private ExchangeRateResponse sendAndParse(String url) throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .header("Accept", "application/json")
-                .header("User-Agent", "Java Currency Converter")
+                .timeout(READ_TIMEOUT)
                 .GET()
+                .header("Accept", "application/json")
                 .build();
 
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response =
+                httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
+        // Basic HTTP validation first
         if (response.statusCode() != 200) {
-            throw new RuntimeException("HTTP error: " + response.statusCode() + " | " + response.body());
+            throw new RuntimeException("HTTP " + response.statusCode() + " | " + response.body());
         }
 
-        System.out.println("[DEBUG] Response body: " + response.body());
-
-        JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
-
-        if (!"success".equalsIgnoreCase(json.get("result").getAsString())) {
-            String error = json.has("error-type") ? json.get("error-type").getAsString() : "Unknown error";
-            throw new RuntimeException("API error: " + error);
+        // Optional quick sanity check before full mapping
+        JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
+        if (!root.has("result")) {
+            throw new RuntimeException("Malformed JSON: missing 'result'");
         }
 
-        return json.get("conversion_result").getAsDouble();
+        // Map to our model
+        return gson.fromJson(response.body(), ExchangeRateResponse.class);
+    }
+
+    private void ensureSuccess(ExchangeRateResponse data) {
+        if (!"success".equalsIgnoreCase(data.getResult())) {
+            // The API often returns an "error-type" when result != success.
+            // If you want, you can parse it from the raw JSON too.
+            throw new RuntimeException("API error: result=" + data.getResult());
+        }
+    }
+
+    private String normalize(String code) {
+        if (code == null) throw new IllegalArgumentException("Currency code cannot be null");
+        String c = code.trim().toUpperCase();
+        if (c.length() != 3) throw new IllegalArgumentException("Invalid currency code: " + code);
+        return c;
     }
 }
