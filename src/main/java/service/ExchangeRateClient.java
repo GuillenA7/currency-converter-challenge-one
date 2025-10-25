@@ -12,6 +12,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
+import com.google.gson.reflect.TypeToken;
+import java.lang.reflect.Type;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
 /**
  * Simple HTTP client for ExchangeRate-API.
  * - Reads API key from env var: EXCHANGE_RATE_API_KEY
@@ -113,5 +119,44 @@ public class ExchangeRateClient {
         String c = code.trim().toUpperCase();
         if (c.length() != 3) throw new IllegalArgumentException("Invalid currency code: " + code);
         return c;
+    }
+
+    /**
+     * Fetches a map of conversion rates for a given base (e.g., latest/USD).
+     * Returns a Map like { "MXN": 18.52, "BRL": 5.12, ... }
+     */
+    public Map<String, Double> getLatestRates(String base) throws IOException, InterruptedException {
+        String url = String.format("%s/%s/latest/%s", BASE_URL, apiKey, normalize(base));
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(READ_TIMEOUT)
+                .GET()
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("HTTP " + response.statusCode() + " | " + response.body());
+        }
+
+        // Parse once to check result and extract conversion_rates object
+        JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
+        if (!root.has("result") || !"success".equalsIgnoreCase(root.get("result").getAsString())) {
+            String error = root.has("error-type") ? root.get("error-type").getAsString() : "Unknown";
+            throw new RuntimeException("API error: " + error);
+        }
+
+        if (!root.has("conversion_rates")) {
+            return Collections.emptyMap();
+        }
+
+        JsonObject ratesObj = root.getAsJsonObject("conversion_rates");
+
+        // Convert JsonObject to Map<String, Double>
+        Type type = new TypeToken<HashMap<String, Double>>(){}.getType();
+        Map<String, Double> rates = new Gson().fromJson(ratesObj, type);
+        return rates != null ? rates : Collections.emptyMap();
     }
 }
