@@ -70,6 +70,8 @@ public class ExchangeRateClient {
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
+                .header("Accept", "application/json")
+                .header("User-Agent", "Java Currency Converter")
                 .GET()
                 .build();
 
@@ -78,6 +80,8 @@ public class ExchangeRateClient {
         if (response.statusCode() != 200) {
             throw new RuntimeException("HTTP error: " + response.statusCode() + " | " + response.body());
         }
+
+        System.out.println("[DEBUG] Response body: " + response.body());
 
         JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
 
